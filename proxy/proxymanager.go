@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+    "slices"
 	"mime/multipart"
 	"net/http"
 	"sort"
@@ -110,6 +111,9 @@ func New(config *Config) *ProxyManager {
 	// Support audio/speech endpoint
 	pm.ginEngine.POST("/v1/audio/speech", pm.proxyOAIHandler)
 	pm.ginEngine.POST("/v1/audio/transcriptions", pm.proxyOAIPostFormHandler)
+
+    // Support infill
+	pm.ginEngine.POST("/infill", pm.proxyOAIHandler)
 
 	pm.ginEngine.GET("/v1/models", pm.listModelsHandler)
 
@@ -361,8 +365,12 @@ func (pm *ProxyManager) proxyOAIHandler(c *gin.Context) {
 
 	requestedModel := gjson.GetBytes(bodyBytes, "model").String()
 	if requestedModel == "" {
-		pm.sendErrorResponse(c, http.StatusBadRequest, "missing or invalid 'model' key")
-	}
+        if c.Request.URL.Path == "/infill" {
+            requestedModel = "infill"
+        } else {
+	    	pm.sendErrorResponse(c, http.StatusBadRequest, "missing or invalid 'model' key")
+        }
+    }
 
 	process, err := pm.swapModel(requestedModel)
 
