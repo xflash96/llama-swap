@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-    "slices"
 	"mime/multipart"
 	"net/http"
 	"sort"
@@ -22,6 +21,70 @@ import (
 const (
 	PROFILE_SPLIT_CHAR = ":"
 )
+
+type bodyLogWriter struct {
+    gin.ResponseWriter
+    body *bytes.Buffer
+}
+
+func (w bodyLogWriter) Write(b []byte) (int, error) {
+    w.body.Write(b)
+    return w.ResponseWriter.Write(b)
+}
+
+func ParseOpenAIStreamFromString(str string) string {
+	var result strings.Builder
+
+    lines := strings.Split(str, "\n")
+    for _, line := range lines {
+
+		// Skip lines that don't start with "data: "
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+
+		// Remove "data: " prefix
+		payload := strings.TrimPrefix(line, "data: ")
+
+		// Check for [DONE] signal
+		if payload == "[DONE]" {
+			break
+		}
+
+		// Use gjson to parse JSON and extract the content
+		content := gjson.Get(payload, "choices.0.delta.content")
+		if content.Exists() {
+			result.WriteString(content.String())
+		}
+	}
+
+	return result.String()
+}
+
+func GetLastUserMessage(jsonStr string) string {
+	// Filter messages where role == "user"
+	result := gjson.Get(jsonStr, `messages.#(role=="user")#.content`)
+
+	if result.IsArray() && result.Array() != nil {
+		arr := result.Array()
+		if len(arr) > 0 {
+			return arr[len(arr)-1].String()
+		}
+	} else if result.Exists() {
+		// Only one user message
+		return result.String()
+	}
+
+	return ""
+}
+
+func PrependLogHeaders(header, msg string) string {
+	lines := strings.Split(msg, "\n")
+	for i, line := range lines {
+		lines[i] = fmt.Sprintf("[%s] %s", header, line)
+	}
+	return strings.Join(lines, "\n")
+}
 
 type ProxyManager struct {
 	sync.Mutex
@@ -42,6 +105,28 @@ func New(config *Config) *ProxyManager {
 
 	if config.LogRequests {
 		pm.ginEngine.Use(func(c *gin.Context) {
+            var reqBuf *bytes.Buffer
+            var respBuf *bytes.Buffer
+            toLogIO := false
+            if config.LogIO {
+                for _, kw := range []string{"/v1/chat"} {
+                    toLogIO = strings.Contains(c.Request.URL.Path, kw)
+                    if toLogIO {
+                        break
+                    }
+                }
+            }
+            if toLogIO {
+                reqRep := bytes.NewBufferString("")
+                tee := io.TeeReader(c.Request.Body, reqRep)
+                body, _ := io.ReadAll(tee)
+                c.Request.Body = io.NopCloser(reqRep)
+
+                reqBuf = bytes.NewBuffer(body)
+                respBuf = bytes.NewBufferString("")
+                blw := &bodyLogWriter{body: respBuf, ResponseWriter: c.Writer}
+                c.Writer = blw
+            }
 			// Start timer
 			start := time.Now()
 
@@ -70,6 +155,23 @@ func New(config *Config) *ProxyManager {
 				c.Request.UserAgent(),
 				duration,
 			)
+            if toLogIO {
+                var log strings.Builder
+                reqBody := reqBuf.String()
+                respBody := respBuf.String()
+                reqContent := GetLastUserMessage(reqBody)
+                respContent := ParseOpenAIStreamFromString(respBody)
+                log.WriteString("[IO.REQ] === REQUEST BODY ===\n")
+                log.WriteString(reqBody)
+                log.WriteString("\n[IO.RESP] === RESPONSE BODY ===\n")
+                log.WriteString(respBody)
+                log.WriteString("\n[IO.REQ] === REQUEST Content ===\n")
+                log.WriteString(PrependLogHeaders("IO.REQ", reqContent))
+                log.WriteString("\n[IO.RESP] === RESPONSE Content ===\n")
+                log.WriteString(PrependLogHeaders("IO.RESP", respContent))
+                log.WriteString("\n[IO] === END IO ===\n")
+                fmt.Fprintf(pm.logMonitor, "%s", log.String())
+            }
 		})
 	}
 
